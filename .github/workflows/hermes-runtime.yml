@@ -10,11 +10,19 @@ concurrency:
 jobs:
   runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Start idle self-stop watcher (15 min without chat)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          chmod +x scripts/idle-watcher.sh
+          nohup scripts/idle-watcher.sh > /tmp/idle-watcher.log 2>&1 &
 
       - name: Start cf-proxy in background
         run: |
