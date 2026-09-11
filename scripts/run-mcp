@@ -10,8 +10,12 @@ PYTHON="/tmp/venv/bin/python"
 
 $PYTHON - <<'PY' > /tmp/mcp_server.log 2>&1 &
 import base64
+import json
 import os
+import signal
+import socket
 import subprocess as s
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -124,9 +128,139 @@ def web_fetch(url: str) -> str:
 
 @mcp.tool()
 def run_background(command: str) -> str:
+    """Start a long-running command detached from the conversation; returns pid + log path (read the log with read_file, manage with list_background / kill_process)."""
     log = f"/tmp/bg-{uuid.uuid4().hex[:8]}.log"
     p = s.Popen(f"{{ {command}; }} >{log} 2>&1", shell=True)
+    try:
+        jobs = json.loads(open(BG_JOBS).read()) if os.path.exists(BG_JOBS) else {}
+    except Exception:
+        jobs = {}
+    jobs[str(p.pid)] = {"command": command, "log": log, "started": time.time()}
+    json.dump(jobs, open(BG_JOBS, "w"))
     return f"started pid {p.pid}, log: {log}"
+
+BG_JOBS = "/tmp/mcp_bg_jobs.json"
+
+@mcp.tool()
+def list_background() -> str:
+    """List background jobs started with run_background: pid, running state, command, log path and last log lines."""
+    if not os.path.exists(BG_JOBS):
+        return "(no background jobs started)"
+    try:
+        jobs = json.loads(open(BG_JOBS).read())
+    except Exception:
+        return "(no background jobs)"
+    lines = []
+    for pid, info in sorted(jobs.items(), key=lambda kv: kv[1].get("started", 0)):
+        alive = os.path.exists(f"/proc/{pid}")
+        try:
+            tail = open(info["log"], errors="replace").read()[-300:]
+        except Exception:
+            tail = "(no log yet)"
+        lines.append(f"pid {pid} [{'running' if alive else 'exited'}] {info['command']}\n  log: {info['log']}\n  tail: {tail!r}")
+    return "\n".join(lines) or "(none)"
+
+@mcp.tool()
+def kill_process(pid: int) -> str:
+    """Force-kill a process by pid (e.g. a background job started with run_background)."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+        return f"killed {pid}"
+    except ProcessLookupError:
+        return f"pid {pid} not running"
+    except PermissionError as e:
+        return f"error: {e}"
+
+@mcp.tool()
+def edit_file(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
+    """Surgical file edit: replace exact `old_text` with `new_text`. Default replaces the first occurrence; replace_all=true replaces every occurrence. Fails if old_text is not found."""
+    if not os.path.exists(path):
+        return f"error: {path} not found"
+    txt = open(path).read()
+    n = txt.count(old_text)
+    if n == 0:
+        return f"error: old_text not found in {path}"
+    txt = txt.replace(old_text, new_text) if replace_all else txt.replace(old_text, new_text, 1)
+    open(path, "w").write(txt)
+    return f"replaced {'all %d' % n if replace_all else 'first of %d' % n} occurrence(s) in {path}"
+
+def git(path, *args):
+    r = s.run(["git", "-C", path, *args], capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+@mcp.tool()
+def git_clone(repo: str, path: str = "") -> str:
+    """Clone a GitHub repo — pass 'owner/name' or a full URL. Returns the local path; the clone gets a pushable authenticated remote (GH_PAT) and a bot identity."""
+    if repo.startswith("http"):
+        url = repo.rstrip("/")
+        name = url.split("/")[-1].removesuffix(".git")
+    else:
+        url = f"https://github.com/{repo}.git"
+        name = repo.split("/")[-1]
+    target = os.path.abspath(path or f"/tmp/repos/{name}")
+    if os.path.exists(target):
+        return f"error: {target} already exists (pull instead: git -C {target} pull)"
+    token_part = f"x-access-token:{GH_TOKEN}@" if GH_TOKEN else ""
+    authed = url.replace("https://", f"https://{token_part}")
+    r = s.run(["git", "clone", authed, target], capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"error: {(r.stdout + r.stderr).strip()[:500]}"
+    git(target, "config", "user.email", "bot@cloudflare-ai")
+    git(target, "config", "user.name", "cloudflare-ai")
+    git(target, "remote", "set-url", "origin", authed)
+    return f"cloned to {target}"
+
+@mcp.tool()
+def git_commit_push(path: str, message: str, branch: str = "") -> str:
+    """In the git repo at `path`: stage all changes, commit with `message`, push to origin (GH_PAT-authenticated). Optional `branch` pushes HEAD to that branch name."""
+    code, out = git(path, "rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        return f"error: {path} is not a git repo"
+    git(path, "add", "-A")
+    code, out = git(path, "commit", "-m", message)
+    if code != 0 and "nothing to commit" not in out:
+        return f"error: {out[:500]}"
+    code, out = git(path, "push", "origin", f"HEAD:{branch}" if branch else "HEAD")
+    if code != 0:
+        return f"error: {out[:500]}"
+    code, out = git(path, "log", "-1", "--oneline")
+    return f"pushed: {out}"
+
+@mcp.tool()
+def http(url: str, method: str = "GET", headers: dict = None, body: str = "") -> str:
+    """Generic HTTP request (any method, headers dict, raw string body — body defaults Content-Type to application/json). Returns 'HTTP <status>' + up to 500 KB of response text. 4xx/5xx responses are returned, not raised."""
+    data = body.encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    if body and "Content-Type" not in (headers or {}):
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return f"HTTP {r.status}\n" + r.read(500_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}\n" + e.read(500_000).decode("utf-8", "replace")
+
+@mcp.tool()
+def wait_for(target: str, timeout_s: int = 60) -> str:
+    """Block until `target` is reachable: an http(s) URL (any HTTP answer counts, even 4xx/5xx) or 'host:port' (TCP connect). Returns elapsed time or an error after timeout."""
+    start = time.time()
+    is_url = target.startswith("http")
+    if not is_url and ":" not in target:
+        return "error: pass an http(s) URL or host:port"
+    while time.time() - start < timeout_s:
+        try:
+            if is_url:
+                urllib.request.urlopen(target, timeout=5)
+                return f"up after {time.time()-start:.0f}s"
+            host, port = target.rsplit(":", 1)
+            with socket.create_connection((host, int(port)), timeout=3):
+                return f"up after {time.time()-start:.0f}s"
+        except urllib.error.HTTPError:
+            return f"up after {time.time()-start:.0f}s (server answered with HTTP error)"
+        except Exception:
+            time.sleep(2)
+    return f"error: {target} not reachable within {timeout_s}s"
 
 mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, path="/mcp")
 PY
