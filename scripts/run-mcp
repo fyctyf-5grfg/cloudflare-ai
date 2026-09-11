@@ -6,6 +6,7 @@ cd "$WORKSPACE"
 
 [ -x /tmp/venv/bin/python ] || python3 -m venv /tmp/venv
 /tmp/venv/bin/python -c "import fastmcp" 2>/dev/null || /tmp/venv/bin/pip install --quiet fastmcp
+/tmp/venv/bin/python -c "import ddgs" 2>/dev/null || /tmp/venv/bin/pip install --quiet ddgs
 PYTHON="/tmp/venv/bin/python"
 
 $PYTHON - <<'PY' > /tmp/mcp_server.log 2>&1 &
@@ -278,6 +279,21 @@ def find(path: str = ".", name: str = "*", type: str = "", max_results: int = 20
                 if len(out) >= max_results:
                     return "\n".join(out) + f"\n(truncated at {max_results} results)"
     return "\n".join(out) or "(no matches)"
+
+@mcp.tool()
+def search(query: str, max_results: int = 8) -> str:
+    """Web search via DuckDuckGo. Returns numbered results: title, url, snippet. Follow up interesting ones with web_fetch."""
+    from ddgs import DDGS
+    n = max(1, min(max_results, 20))
+    with DDGS() as d:
+        rs = list(d.text(query, max_results=n))
+    if not rs:
+        return "(no results)"
+    out = []
+    for i, r in enumerate(rs):
+        url = r.get("href") or r.get("url") or ""
+        out.append(f"{i+1}. {r.get('title','')}\n{url}\n{(r.get('body') or '')[:300]}")
+    return "\n\n".join(out)
 
 mcp.run(transport="streamable-http", host="0.0.0.0", port=8000, path="/mcp")
 PY
