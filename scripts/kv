@@ -69,12 +69,32 @@ watch_port() {
     done
   ) &
 
-  # supervisor: restart cloudflared if it dies (QUIC tunnels drop on GHA);
-  # http2 transport survives restrictive egress far better than quic
+  # supervisor: restart cloudflared if it dies OR if the tunnel stops answering
+  # (QUIC/edge disconnects leave the process alive but unreachable on GHA)
   (
     while true; do
-      "$CF_BIN" tunnel --no-autoupdate --protocol http2 --url "http://localhost:$port" --metrics "localhost:0" >>"$log" 2>&1
-      echo "[supervisor] cloudflared for port $port exited ($?), restarting in 3s" >>"$log"
+      "$CF_BIN" tunnel --no-autoupdate --protocol http2 --url "http://localhost:$port" --metrics "localhost:0" >>"$log" 2>&1 &
+      TF_PID=$!
+      FAILS=0
+      while kill -0 "$TF_PID" 2>/dev/null; do
+        sleep 45
+        url=$(grep -m1 -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$log" 2>/dev/null | tail -1)
+        [ -z "$url" ] && continue
+        code=$(curl -s -o /dev/null -m 10 -w "%{http_code}" "$url" 2>/dev/null || echo 000)
+        if [ "$code" = "000" ] || [ "$code" = "530" ]; then
+          FAILS=$((FAILS + 1))
+          echo "[supervisor] tunnel probe $code ($FAILS/3 fails) for port $port" >>"$log"
+          if [ "$FAILS" -ge 3 ]; then
+            echo "[supervisor] tunnel unhealthy — killing cloudflared for port $port" >>"$log"
+            kill -9 "$TF_PID" 2>/dev/null
+            break
+          fi
+        else
+          FAILS=0
+        fi
+      done
+      wait "$TF_PID" 2>/dev/null
+      echo "[supervisor] cloudflared for port $port exited — restarting in 3s" >>"$log"
       sleep 3
       rm -f "$log"; touch "$log"
     done
