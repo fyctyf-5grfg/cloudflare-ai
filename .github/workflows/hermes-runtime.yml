@@ -24,15 +24,6 @@ jobs:
           chmod +x scripts/idle-watcher.sh
           nohup scripts/idle-watcher.sh > /tmp/idle-watcher.log 2>&1 &
 
-      - name: Start cf-proxy in background
-        run: |
-          nohup python3 scripts/cf-proxy.py > /tmp/cf-proxy.log 2>&1 &
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8788/health; then break; fi
-            sleep 2
-          done
-          curl -fsS http://127.0.0.1:8788/health > /dev/null
-
       - name: Start run-mcp in background
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -47,4 +38,4 @@ jobs:
       - name: Run kv tunnel supervisor (keeps job alive until timeout)
         run: |
           chmod +x scripts/kv
-          ./scripts/kv 8000 8788
+          ./scripts/kv 8000
